@@ -1,0 +1,19 @@
+# Web Server
+Flask==3.0.0
+flask-cors==4.0.0
+gunicorn==21.2.0
+
+# Document Parsing
+PyPDF2==3.0.1
+pdfminer.six==20231228
+docx2txt==0.8
+
+# AI & LLM
+groq
+python-dotenv
+
+# Audio Analysis
+librosa
+numpy
+scipy
+soundfile
