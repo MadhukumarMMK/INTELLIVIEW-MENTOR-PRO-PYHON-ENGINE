@@ -1,0 +1,23 @@
+{
+  "input_shape": [
+    128,
+    130,
+    1
+  ],
+  "n_mels": 128,
+  "n_frames": 130,
+  "sample_rate": 22050,
+  "duration": 3,
+  "classes": [
+    "angry",
+    "calm",
+    "disgust",
+    "fearful",
+    "happy",
+    "neutral",
+    "sad",
+    "surprised"
+  ],
+  "test_accuracy": 0.9714506268501282,
+  "model_type": "2d_cnn_mel_spectrogram"
+}

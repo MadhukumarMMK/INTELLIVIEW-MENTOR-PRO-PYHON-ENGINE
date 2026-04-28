@@ -1,0 +1,13 @@
+# Local training dependencies — NOT used on Render
+# Install with: pip install -r requirements-training.txt
+
+# Audio processing
+librosa==0.10.1
+soundfile==0.12.1
+
+# Deep learning — pin to 2.17+ for Keras 3 compatibility with Colab-trained models
+tensorflow>=2.17,<2.20
+
+# ML utilities
+scikit-learn==1.3.2
+numpy==1.26.2

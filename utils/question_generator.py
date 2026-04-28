@@ -1,9 +1,35 @@
 import os
+import random
 from groq import Groq
 from dotenv import load_dotenv
 import json
 
 load_dotenv()
+
+# Variety pools — LLM picks from a randomized subset each turn to avoid ruts
+HR_THEMES = [
+    "teamwork and collaboration", "conflict resolution", "leadership under pressure",
+    "failure and learning from it", "handling disagreement with a manager",
+    "prioritization when overwhelmed", "giving difficult feedback", "adapting to change",
+    "making a hard decision with limited info", "motivating a struggling teammate",
+    "dealing with ambiguous requirements", "owning a mistake publicly",
+    "time management across competing deadlines", "professional growth moments",
+    "resolving cross-team dependencies", "managing up / influencing without authority",
+    "balancing quality and speed", "cultural differences at work"
+]
+
+RESUME_ANGLES = [
+    "why they chose that technology over alternatives",
+    "the trickiest bug they fixed in that stack",
+    "a trade-off they made in their architecture",
+    "how they would improve their previous project today",
+    "performance optimization they did",
+    "a concept from that tech they find confusing",
+    "how they'd onboard a junior dev to that stack",
+    "a design decision that didn't age well",
+    "scaling challenges they anticipate",
+    "security considerations they think about"
+]
 
 # Initialize the Groq client
 api_key = os.environ.get("GROQ_API_KEY")
@@ -28,44 +54,49 @@ def generate_interview_questions(tech=None, module=None, topic=None, difficulty=
     """
 
     if mode == "hr":
+        chosen_theme = random.choice(HR_THEMES)
         system_prompt = f"""
         You are an HR interviewer. Generate 1 opening behavioral question.
-        Difficulty: {difficulty}. Focus: conflict resolution, leadership, adaptability.
-        No code or technical concepts.
+        Difficulty: {difficulty}.
+        THIS QUESTION'S THEME (use this specific angle): {chosen_theme}
+        No code or technical concepts. Use a STAR-style opener (Tell me about a time...).
         {CONCISE_RULE}
-        Return ONLY JSON: {{"questions": ["your question"]}}
+        Return ONLY a valid JSON object: {{"questions": ["your question"]}}
         """
 
     elif mode == "resume":
         skills_list = skills if isinstance(skills, list) else []
         skills_str = ", ".join(skills_list) if skills_list else "Full Stack Development"
+        chosen_skill = random.choice(skills_list) if skills_list else "their strongest skill"
+        chosen_angle = random.choice(RESUME_ANGLES)
         system_prompt = f"""
         You are a technical interviewer. Candidate skills: {skills_str}.
-        Generate 1 theoretical question about their strongest skill.
+        FOCUS THIS QUESTION ON: {chosen_skill}
+        ANGLE (use this framing): {chosen_angle}
         Difficulty: {difficulty}. No code syntax — focus on "why" and "how".
         {CONCISE_RULE}
-        Return ONLY JSON: {{"questions": ["your question"]}}
+        Return ONLY a valid JSON object: {{"questions": ["your question"]}}
         """
 
     else:
         system_prompt = f"""
         You are a technical interviewer.
         Tech: {tech or 'General'} | Module: {module} | Topic: {topic}
-        Generate 1 conceptual question. Difficulty: {difficulty}.
-        No code — focus on architecture, trade-offs, and design.
+        Generate 1 conceptual question strictly within {tech or 'this'} and {topic or 'this topic'}.
+        Difficulty: {difficulty}. No code — focus on architecture, trade-offs, and design.
         {CONCISE_RULE}
-        Return ONLY JSON: {{"questions": ["your question"]}}
+        Return ONLY a valid JSON object: {{"questions": ["your question"]}}
         """
 
     try:
         chat_completion = client.chat.completions.create(
             messages=[{"role": "system", "content": system_prompt}],
             model="llama-3.3-70b-versatile",
-            temperature=0.7,
+            temperature=0.95,
             response_format={"type": "json_object"}
         )
         return json.loads(chat_completion.choices[0].message.content)
-    
+
     except Exception as e:
         print(f"❌ Groq API Error in generate_interview_questions: {e}")
         # Provide a mode-aware fallback question
@@ -128,20 +159,53 @@ def generate_adaptive_question(tech, skills, difficulty, previous_questions, mod
     """
 
     if mode == "hr":
+        # Avoid themes whose first two words already appear in prior questions.
+        # Using two words tightens matching so unrelated themes aren't over-filtered.
+        def _theme_used(theme, prev):
+            head = " ".join(theme.split()[:2]).lower()
+            return any(head in q.lower() for q in prev)
+        unused_themes = [t for t in HR_THEMES if not _theme_used(t, previous_questions)]
+        pool = unused_themes if unused_themes else HR_THEMES
+        new_theme = random.choice(pool)
         system_prompt = f"""
     HR interviewer. Difficulty: {difficulty}.
-    Previous (DON'T REPEAT): {prev_q_str}
+    Previous questions (DO NOT REPEAT OR REPHRASE): {prev_q_str}
     {performance_hint}
-    Generate ONE short follow-up behavioral question connected to the candidate's answer.
+    NEW THEME FOR THIS QUESTION (pivot here — don't stay on the last theme): {new_theme}
+    Generate ONE short behavioral question on the new theme, loosely connected to their last answer.
+    {CONCISE_RULE}
+    Return ONLY a valid JSON object: {{"question": "...", "difficulty": "{difficulty}"}}
+    """
+    elif mode == "resume":
+        skills_list = [s for s in (skills or []) if isinstance(s, str) and s.strip()]
+        if skills_list:
+            unused_skills = [s for s in skills_list
+                             if not any(s.lower() in q.lower() for q in previous_questions)]
+            next_skill = random.choice(unused_skills if unused_skills else skills_list)
+        else:
+            # No skills extracted from resume → fall back to generic full-stack topics
+            next_skill = random.choice([
+                "their primary web framework", "their most-used database",
+                "their preferred language", "the deployment stack they know best"
+            ])
+        next_angle = random.choice(RESUME_ANGLES)
+        system_prompt = f"""
+    Technical interviewer. {context} | Difficulty: {difficulty}
+    Previous questions (DO NOT REPEAT OR REPHRASE): {prev_q_str}
+    {performance_hint}
+    FOCUS THIS QUESTION ON SKILL: {next_skill}
+    ANGLE: {next_angle}
+    Generate ONE short follow-up question grounded in that skill.
+    No code — focus on "why" and "how". If confidence is low ({fused_confidence}%), be encouraging.
     {CONCISE_RULE}
     Return ONLY a valid JSON object: {{"question": "...", "difficulty": "{difficulty}"}}
     """
     else:
         system_prompt = f"""
     Technical interviewer. {context} | Difficulty: {difficulty}
-    Previous (DON'T REPEAT): {prev_q_str}
+    Previous questions (DO NOT REPEAT OR REPHRASE): {prev_q_str}
     {performance_hint}
-    Generate ONE short follow-up question building on the candidate's last answer.
+    Stay strictly within {tech}. Generate ONE short follow-up question that extends their last answer.
     No code — focus on "why" and "how". If confidence is low ({fused_confidence}%), be encouraging.
     {CONCISE_RULE}
     Return ONLY a valid JSON object: {{"question": "...", "difficulty": "{difficulty}"}}
@@ -151,6 +215,7 @@ def generate_adaptive_question(tech, skills, difficulty, previous_questions, mod
         chat_completion = client.chat.completions.create(
             messages=[{"role": "system", "content": system_prompt}],
             model="llama-3.1-8b-instant",
+            temperature=0.9,
             response_format={"type": "json_object"}
         )
         return json.loads(chat_completion.choices[0].message.content)

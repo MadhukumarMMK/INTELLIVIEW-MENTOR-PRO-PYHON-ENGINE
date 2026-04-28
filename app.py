@@ -3,6 +3,7 @@ from flask_cors import CORS
 from werkzeug.utils import secure_filename
 import os
 import base64
+import binascii
 import tempfile
 
 # Import your custom logic
@@ -13,7 +14,11 @@ from utils.question_generator import (
 )
 from utils.evaluator import evaluate_answer
 from utils.adaptive_brain import brain # RL Policy Logic (Goal #20)
-from utils.audio_analyzer import extract_audio_features
+from utils.audio_analyzer import analyze_audio_size
+
+# AUDIO_MODE: "real" uses trained SER model (local 16GB RAM)
+#             "size" uses file-size heuristic (Render free tier)
+AUDIO_MODE = os.getenv("AUDIO_MODE", "real").lower()
 
 app = Flask(__name__)
 CORS(app)
@@ -110,21 +115,52 @@ def adaptive_step():
         eval_result = evaluate_answer(question_text, answer_text)
         last_score = eval_result.get('score', 0) if not was_skipped else 0
 
-        # 2. Audio Confidence via Librosa/CNN-LSTM (Goal #20)
+        # 2. Audio Confidence — dual-mode
+        #    AUDIO_MODE=real → decode base64 audio, run SER model (local)
+        #    AUDIO_MODE=size → size-based heuristic only (Render)
         audio_confidence = None
-        audio_b64 = data.get('audio_data', '')
-        if audio_b64:
+        audio_emotion = None
+        audio_size = data.get('audio_size', 0)
+        audio_base64 = data.get('audio_base64')
+
+        if AUDIO_MODE == "real" and audio_base64:
+            tmp_path = None
             try:
-                audio_bytes = base64.b64decode(audio_b64)
-                tmp = tempfile.NamedTemporaryFile(suffix='.webm', delete=False)
-                tmp.write(audio_bytes)
-                tmp.close()
-                audio_confidence = extract_audio_features(tmp.name)
-                os.remove(tmp.name)
-                print(f"🎧 Audio Confidence (Librosa): {audio_confidence}")
+                # Validate base64 before writing to disk
+                try:
+                    audio_bytes = base64.b64decode(audio_base64, validate=True)
+                except (binascii.Error, ValueError) as decode_err:
+                    raise ValueError(f"Invalid base64 audio payload: {decode_err}")
+
+                with tempfile.NamedTemporaryFile(suffix='.webm', delete=False) as tmp:
+                    tmp.write(audio_bytes)
+                    tmp_path = tmp.name
+
+                from utils.audio_analyzer import analyze_audio
+                ser_result = analyze_audio(tmp_path)
+                if ser_result is not None:
+                    audio_confidence = ser_result['confidence']
+                    audio_emotion = ser_result['emotion']
+                    print(f"🎙️ SER | Emotion: {audio_emotion} | Confidence: {audio_confidence}")
+                else:
+                    audio_confidence = analyze_audio_size(audio_size)
+                    print(f"🎙️ SER unavailable, using size heuristic: {audio_confidence}")
             except Exception as audio_err:
-                print(f"⚠️ Audio analysis fallback: {audio_err}")
-                audio_confidence = None
+                print(f"⚠️ Audio SER fallback: {audio_err}")
+                audio_confidence = analyze_audio_size(audio_size)
+            finally:
+                if tmp_path and os.path.exists(tmp_path):
+                    try:
+                        os.remove(tmp_path)
+                    except Exception:
+                        pass
+        elif audio_size and audio_size > 0:
+            audio_confidence = analyze_audio_size(audio_size)
+            print(f"Audio Confidence (size-based): {audio_confidence} ({audio_size} bytes)")
+
+        # Safety default — never pass None to the brain (fusion math breaks)
+        if audio_confidence is None:
+            audio_confidence = 50
 
         # 3. RL Brain Logic — fuses face + audio confidence (Goal #20)
         next_diff, fused_confidence = brain.decide_next_level(
@@ -153,7 +189,8 @@ def adaptive_step():
             "last_score": last_score,
             "feedback": eval_result.get('feedback'),
             "fused_confidence": fused_confidence,
-            "audio_confidence": audio_confidence
+            "audio_confidence": audio_confidence,
+            "audio_emotion": audio_emotion
         })
     except Exception as e:
         print(f"🔥 Adaptive Step Error: {e}")

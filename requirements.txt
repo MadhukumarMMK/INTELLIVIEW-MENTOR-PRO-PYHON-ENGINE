@@ -12,8 +12,5 @@ docx2txt==0.8
 groq
 python-dotenv
 
-# Audio Analysis
-librosa
+# Core
 numpy
-scipy
-soundfile
