@@ -1,16 +1,41 @@
 import os
-from groq import Groq
-from dotenv import load_dotenv
 import json
+from anthropic import Anthropic
+from dotenv import load_dotenv
 
 load_dotenv()
 
-# Initialize Groq client with a fallback to prevent 500 errors if ENV is missing
-api_key = os.environ.get("GROQ_API_KEY")
-client = Groq(api_key=api_key) if api_key else None
+# Accept either ANTHROPIC_API_KEY (convention) or Anthropic_API_KEY (the name
+# this project's .env historically used) so an old .env keeps working.
+api_key = os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("Anthropic_API_KEY")
+client = Anthropic(api_key=api_key) if api_key else None
+
+# Frozen system prompt — identical across every call so the prefix is cacheable.
+# Question + answer go in the user turn so they don't invalidate the cached prefix.
+EVALUATOR_SYSTEM_PROMPT = """You are a technical interviewer evaluating a candidate's response.
+
+Evaluate the answer for technical accuracy and completeness. Return a JSON object with exactly two fields:
+1. 'score': integer in [0, 100]
+2. 'feedback': a single concise sentence explaining the score
+
+Respond with ONLY the JSON object — no preamble, no markdown fences, no commentary.
+Example: {"score": 85, "feedback": "Excellent explanation, but could mention X."}"""
+
+
+def _extract_json(text: str) -> dict:
+    """Tolerantly extract a JSON object from Claude's response."""
+    text = text.strip()
+    if text.startswith("```"):
+        # Strip ```json ... ``` or ``` ... ``` fences if the model adds them
+        text = text.split("```", 2)[1]
+        if text.lstrip().lower().startswith("json"):
+            text = text.lstrip()[4:]
+        text = text.strip()
+    return json.loads(text)
+
 
 def evaluate_answer(question, user_answer):
-    # Safety Check: If Groq client failed to initialize
+    # Safety check: Anthropic client failed to initialize
     if not client:
         return {"score": 50, "feedback": "AI Engine configuration missing. Check .env file."}
 
@@ -18,35 +43,30 @@ def evaluate_answer(question, user_answer):
     if not user_answer or len(user_answer.strip()) < 5:
         return {"score": 0, "feedback": "The answer was too short or skipped to be evaluated technically."}
 
-    system_prompt = f"""
-    You are a technical interviewer evaluating a candidate's response.
-    
-    Question: {question}
-    Candidate's Answer: {user_answer}
-    
-    Evaluate the answer for technical accuracy and completeness. 
-    Return a JSON object with:
-    1. 'score': (0-100 integer)
-    2. 'feedback': (A single concise sentence explaining the score)
-    
-    Format: {{"score": 85, "feedback": "Excellent explanation, but could mention X."}}
-    """
+    user_message = f"Question: {question}\n\nCandidate's Answer: {user_answer}"
 
     try:
-        chat_completion = client.chat.completions.create(
-            messages=[{"role": "system", "content": system_prompt}],
-            model="llama-3.3-70b-versatile", # Highly recommended for more accurate technical evaluation
-            temperature=0.1, # Extremely low temperature for objective technical scoring
-            response_format={"type": "json_object"}
+        response = client.messages.create(
+            model="claude-haiku-4-5",
+            max_tokens=512,
+            temperature=0.1,  # objective technical scoring
+            system=[
+                {
+                    "type": "text",
+                    "text": EVALUATOR_SYSTEM_PROMPT,
+                    "cache_control": {"type": "ephemeral"},
+                }
+            ],
+            messages=[{"role": "user", "content": user_message}],
         )
-        
-        # Parse result and ensure keys exist before returning to Flask
-        result = json.loads(chat_completion.choices[0].message.content)
+
+        text = next((b.text for b in response.content if b.type == "text"), "")
+        result = _extract_json(text)
         return {
             "score": result.get("score", 0),
-            "feedback": result.get("feedback", "No specific feedback provided.")
+            "feedback": result.get("feedback", "No specific feedback provided."),
         }
     except Exception as e:
-        print(f"❌ Groq Evaluation Error: {e}")
-        # Goal #5: Ensure a fallback score is returned so the session doesn't hang
+        print(f"❌ Anthropic Evaluation Error: {e}")
+        # Goal #5: Fallback score so the session doesn't hang
         return {"score": 40, "feedback": "System encountered an error during evaluation."}

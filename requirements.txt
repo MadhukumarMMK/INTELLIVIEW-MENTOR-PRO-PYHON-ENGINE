@@ -8,8 +8,8 @@ PyPDF2==3.0.1
 pdfminer.six==20231228
 docx2txt==0.8
 
-# AI & LLM
-groq
+# AI & LLM (Anthropic Claude — Haiku 4.5 for question gen + answer evaluation)
+anthropic>=0.40.0
 python-dotenv
 
 # Core

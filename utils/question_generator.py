@@ -1,8 +1,8 @@
 import os
-import random
-from groq import Groq
-from dotenv import load_dotenv
 import json
+import random
+from anthropic import Anthropic
+from dotenv import load_dotenv
 
 load_dotenv()
 
@@ -31,77 +31,132 @@ RESUME_ANGLES = [
     "security considerations they think about"
 ]
 
-# Initialize the Groq client
-api_key = os.environ.get("GROQ_API_KEY")
-client = Groq(api_key=api_key) if api_key else None
+# Accept either ANTHROPIC_API_KEY (convention) or Anthropic_API_KEY (the name
+# this project's .env historically used) so an old .env keeps working.
+api_key = os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("Anthropic_API_KEY")
+client = Anthropic(api_key=api_key) if api_key else None
+
+CONCISE_RULE = """CRITICAL: Keep the question SHORT and CRISPY — maximum 1-2 sentences (under 30 words).
+Ask ONE clear thing. Do NOT combine multiple questions into one. The candidate must understand instantly without re-reading."""
+
+# --- Frozen per-mode system prompts (cacheable). All dynamic context goes in the user turn. ---
+
+HR_INITIAL_SYSTEM = f"""You are an HR interviewer generating the OPENING behavioral question of an interview.
+No code or technical concepts. Use a STAR-style opener (e.g. "Tell me about a time...").
+{CONCISE_RULE}
+Return ONLY a valid JSON object in this exact shape: {{"questions": ["your question"]}}"""
+
+RESUME_INITIAL_SYSTEM = f"""You are a technical interviewer generating the OPENING question for a resume-based interview.
+No code syntax — focus on "why" and "how".
+{CONCISE_RULE}
+Return ONLY a valid JSON object in this exact shape: {{"questions": ["your question"]}}"""
+
+CUSTOM_INITIAL_SYSTEM = f"""You are a technical interviewer generating the OPENING question for a topic-based interview.
+No code — focus on architecture, trade-offs, and design.
+{CONCISE_RULE}
+Return ONLY a valid JSON object in this exact shape: {{"questions": ["your question"]}}"""
+
+HR_ADAPTIVE_SYSTEM = f"""You are an HR interviewer running a multi-turn behavioral interview.
+DO NOT repeat or rephrase any previous question.
+Pivot to the new theme provided — don't stay on the previous theme.
+Loosely connect the new question to the candidate's last answer when one is given.
+{CONCISE_RULE}
+Return ONLY a valid JSON object in this exact shape: {{"question": "...", "difficulty": "..."}}"""
+
+RESUME_ADAPTIVE_SYSTEM = f"""You are a technical interviewer running a multi-turn resume-based interview.
+DO NOT repeat or rephrase any previous question.
+Generate a follow-up grounded in the focus skill provided.
+No code — focus on "why" and "how". If candidate confidence is low, be encouraging.
+{CONCISE_RULE}
+Return ONLY a valid JSON object in this exact shape: {{"question": "...", "difficulty": "..."}}"""
+
+CUSTOM_ADAPTIVE_SYSTEM = f"""You are a technical interviewer running a multi-turn topic-based interview.
+DO NOT repeat or rephrase any previous question.
+Stay strictly within the technology provided. Extend the candidate's last answer.
+No code — focus on "why" and "how". If candidate confidence is low, be encouraging.
+{CONCISE_RULE}
+Return ONLY a valid JSON object in this exact shape: {{"question": "...", "difficulty": "..."}}"""
+
+
+def _extract_json(text: str) -> dict:
+    """Tolerantly extract a JSON object from Claude's response."""
+    text = text.strip()
+    if text.startswith("```"):
+        text = text.split("```", 2)[1]
+        if text.lstrip().lower().startswith("json"):
+            text = text.lstrip()[4:]
+        text = text.strip()
+    return json.loads(text)
+
+
+def _call_claude(system_prompt: str, user_message: str, temperature: float) -> str:
+    """Single Anthropic call with cached system prompt. Returns the text content."""
+    response = client.messages.create(
+        model="claude-haiku-4-5",
+        max_tokens=1024,
+        temperature=temperature,
+        system=[
+            {
+                "type": "text",
+                "text": system_prompt,
+                "cache_control": {"type": "ephemeral"},
+            }
+        ],
+        messages=[{"role": "user", "content": user_message}],
+    )
+    return next((b.text for b in response.content if b.type == "text"), "")
+
 
 def generate_interview_questions(tech=None, module=None, topic=None, difficulty="Medium", mode="custom", skills=None):
     """
-    Goal #1, #2, & #3: Theory-focused Multi-mode generation.
-    Updated to prioritize conceptual communication over coding syntax.
+    Goal #1, #2, & #3: Theory-focused multi-mode generation.
+    Returns the OPENING question only — adaptive turns come from generate_adaptive_question.
     """
-    # Safety Check: If Groq client failed to initialize, provide a mode-aware fallback.
     if not client:
-        print("❌ Groq client not initialized. Check GROQ_API_KEY in .env file.")
+        print("❌ Anthropic client not initialized. Check ANTHROPIC_API_KEY in .env file.")
         fallback_q = "Describe a challenging situation you faced at work and how you handled it." if mode == "hr" else "Explain the core architectural principles of your primary stack."
         return {"questions": [fallback_q]}
 
-    # Conciseness rule applied to all modes
-    CONCISE_RULE = """
-    CRITICAL: Keep the question SHORT and CRISPY — maximum 1-2 sentences (under 30 words).
-    Ask ONE clear thing. Do NOT combine multiple questions into one.
-    The candidate must understand instantly without re-reading.
-    """
-
     if mode == "hr":
         chosen_theme = random.choice(HR_THEMES)
-        system_prompt = f"""
-        You are an HR interviewer. Generate 1 opening behavioral question.
-        Difficulty: {difficulty}.
-        THIS QUESTION'S THEME (use this specific angle): {chosen_theme}
-        No code or technical concepts. Use a STAR-style opener (Tell me about a time...).
-        {CONCISE_RULE}
-        Return ONLY a valid JSON object: {{"questions": ["your question"]}}
-        """
+        system_prompt = HR_INITIAL_SYSTEM
+        user_msg = (
+            f"Difficulty: {difficulty}\n"
+            f"Theme for this question: {chosen_theme}\n\n"
+            f"Generate the question now."
+        )
 
     elif mode == "resume":
         skills_list = skills if isinstance(skills, list) else []
         skills_str = ", ".join(skills_list) if skills_list else "Full Stack Development"
         chosen_skill = random.choice(skills_list) if skills_list else "their strongest skill"
         chosen_angle = random.choice(RESUME_ANGLES)
-        system_prompt = f"""
-        You are a technical interviewer. Candidate skills: {skills_str}.
-        FOCUS THIS QUESTION ON: {chosen_skill}
-        ANGLE (use this framing): {chosen_angle}
-        Difficulty: {difficulty}. No code syntax — focus on "why" and "how".
-        {CONCISE_RULE}
-        Return ONLY a valid JSON object: {{"questions": ["your question"]}}
-        """
+        system_prompt = RESUME_INITIAL_SYSTEM
+        user_msg = (
+            f"Candidate skills: {skills_str}\n"
+            f"Focus this question on: {chosen_skill}\n"
+            f"Angle (use this framing): {chosen_angle}\n"
+            f"Difficulty: {difficulty}\n\n"
+            f"Generate the question now."
+        )
 
     else:
-        system_prompt = f"""
-        You are a technical interviewer.
-        Tech: {tech or 'General'} | Module: {module} | Topic: {topic}
-        Generate 1 conceptual question strictly within {tech or 'this'} and {topic or 'this topic'}.
-        Difficulty: {difficulty}. No code — focus on architecture, trade-offs, and design.
-        {CONCISE_RULE}
-        Return ONLY a valid JSON object: {{"questions": ["your question"]}}
-        """
+        system_prompt = CUSTOM_INITIAL_SYSTEM
+        user_msg = (
+            f"Tech: {tech or 'General'} | Module: {module} | Topic: {topic}\n"
+            f"Stay strictly within {tech or 'this'} and {topic or 'this topic'}.\n"
+            f"Difficulty: {difficulty}\n\n"
+            f"Generate the question now."
+        )
 
     try:
-        chat_completion = client.chat.completions.create(
-            messages=[{"role": "system", "content": system_prompt}],
-            model="llama-3.3-70b-versatile",
-            temperature=0.95,
-            response_format={"type": "json_object"}
-        )
-        return json.loads(chat_completion.choices[0].message.content)
-
+        text = _call_claude(system_prompt, user_msg, temperature=0.95)
+        return _extract_json(text)
     except Exception as e:
-        print(f"❌ Groq API Error in generate_interview_questions: {e}")
-        # Provide a mode-aware fallback question
+        print(f"❌ Anthropic API Error in generate_interview_questions: {e}")
         fallback_q = "Describe a challenging situation you faced at work and how you handled it." if mode == "hr" else "Explain the core architectural principles of your primary stack."
         return {"questions": [fallback_q]}
+
 
 # --- Adaptive Pacing Logic (Goal #10 & #20) ---
 
@@ -113,69 +168,55 @@ def generate_adaptive_question(tech, skills, difficulty, previous_questions, mod
     - Adaptive: Adjusts depth/tone based on score + multimodal confidence.
     - Interactive: Maintains conversational interview flow across all modes.
     """
-    # Safety Check: If Groq client failed to initialize
     if not client:
-        print("❌ Groq client not initialized. Check GROQ_API_KEY in .env file.")
+        print("❌ Anthropic client not initialized. Check ANTHROPIC_API_KEY in .env file.")
         return {"question": "Explain the data flow in your recent project architecture.", "difficulty": difficulty}
 
-    # Build context based on interview mode
-    if mode == "hr":
-        context = "HR Behavioral Interview — focus on leadership, conflict resolution, and adaptability"
-    elif mode == "resume":
-        context = f"Resume-Based Interview — Candidate Skills: {', '.join(skills) if skills else 'Full Stack Development'}"
-    else:
-        context = f"Technical Interview — Technology: {tech}"
-
-    # Build candidate performance snapshot for the LLM
+    # Build candidate performance hint
     performance_hint = ""
     if last_answer and last_answer != "SKIPPED":
-        performance_hint = f"""
-    --- CANDIDATE'S LAST RESPONSE ---
-    Their Answer: "{last_answer}"
-    Evaluator Feedback: {last_feedback}
-    Accuracy Score: {last_score}/100
-    Multimodal Confidence (face + voice): {fused_confidence}/100
-    ---
-    USE this answer to make your next question a DIRECT FOLLOW-UP.
-    If they mentioned a concept, dig deeper into it.
-    If they were vague, ask them to clarify that specific point.
-    If they were wrong, gently redirect by asking about the correct approach.
-    """
+        performance_hint = (
+            "--- CANDIDATE'S LAST RESPONSE ---\n"
+            f"Their Answer: \"{last_answer}\"\n"
+            f"Evaluator Feedback: {last_feedback}\n"
+            f"Accuracy Score: {last_score}/100\n"
+            f"Multimodal Confidence (face + voice): {fused_confidence}/100\n"
+            "---\n"
+            "USE this answer to make your next question a DIRECT FOLLOW-UP.\n"
+            "If they mentioned a concept, dig deeper into it.\n"
+            "If they were vague, ask them to clarify that specific point.\n"
+            "If they were wrong, gently redirect by asking about the correct approach."
+        )
     elif last_answer == "SKIPPED":
         last_q_ref = previous_questions[-1] if previous_questions else "the previous question"
-        performance_hint = f"""
-    --- CANDIDATE SKIPPED THE LAST QUESTION ---
-    Skipped Question: "{last_q_ref}"
-    They may be uncomfortable with that specific topic.
-    Pivot to a DIFFERENT but related angle at an easier depth.
-    Do NOT re-ask the same question in different words.
-    """
+        performance_hint = (
+            "--- CANDIDATE SKIPPED THE LAST QUESTION ---\n"
+            f"Skipped Question: \"{last_q_ref}\"\n"
+            "They may be uncomfortable with that specific topic.\n"
+            "Pivot to a DIFFERENT but related angle at an easier depth.\n"
+            "Do NOT re-ask the same question in different words."
+        )
 
     prev_q_str = ", ".join(previous_questions) if previous_questions else "None yet"
 
-    CONCISE_RULE = """
-    CRITICAL: Keep the question SHORT — max 1-2 sentences, under 30 words.
-    Ask ONE clear thing. No multi-part questions. The candidate must get it instantly.
-    """
-
     if mode == "hr":
         # Avoid themes whose first two words already appear in prior questions.
-        # Using two words tightens matching so unrelated themes aren't over-filtered.
         def _theme_used(theme, prev):
             head = " ".join(theme.split()[:2]).lower()
             return any(head in q.lower() for q in prev)
         unused_themes = [t for t in HR_THEMES if not _theme_used(t, previous_questions)]
         pool = unused_themes if unused_themes else HR_THEMES
         new_theme = random.choice(pool)
-        system_prompt = f"""
-    HR interviewer. Difficulty: {difficulty}.
-    Previous questions (DO NOT REPEAT OR REPHRASE): {prev_q_str}
-    {performance_hint}
-    NEW THEME FOR THIS QUESTION (pivot here — don't stay on the last theme): {new_theme}
-    Generate ONE short behavioral question on the new theme, loosely connected to their last answer.
-    {CONCISE_RULE}
-    Return ONLY a valid JSON object: {{"question": "...", "difficulty": "{difficulty}"}}
-    """
+
+        system_prompt = HR_ADAPTIVE_SYSTEM
+        user_msg = (
+            f"Difficulty: {difficulty}\n"
+            f"Previous questions (DO NOT REPEAT OR REPHRASE): {prev_q_str}\n"
+            f"{performance_hint}\n\n"
+            f"NEW THEME for this question (pivot here): {new_theme}\n\n"
+            f"Generate the question now."
+        )
+
     elif mode == "resume":
         skills_list = [s for s in (skills or []) if isinstance(s, str) and s.strip()]
         if skills_list:
@@ -189,36 +230,34 @@ def generate_adaptive_question(tech, skills, difficulty, previous_questions, mod
                 "their preferred language", "the deployment stack they know best"
             ])
         next_angle = random.choice(RESUME_ANGLES)
-        system_prompt = f"""
-    Technical interviewer. {context} | Difficulty: {difficulty}
-    Previous questions (DO NOT REPEAT OR REPHRASE): {prev_q_str}
-    {performance_hint}
-    FOCUS THIS QUESTION ON SKILL: {next_skill}
-    ANGLE: {next_angle}
-    Generate ONE short follow-up question grounded in that skill.
-    No code — focus on "why" and "how". If confidence is low ({fused_confidence}%), be encouraging.
-    {CONCISE_RULE}
-    Return ONLY a valid JSON object: {{"question": "...", "difficulty": "{difficulty}"}}
-    """
+        skills_str = ", ".join(skills_list) if skills_list else "Full Stack Development"
+
+        system_prompt = RESUME_ADAPTIVE_SYSTEM
+        user_msg = (
+            f"Context: Resume-Based Interview — Candidate Skills: {skills_str}\n"
+            f"Difficulty: {difficulty}\n"
+            f"Previous questions (DO NOT REPEAT OR REPHRASE): {prev_q_str}\n"
+            f"{performance_hint}\n\n"
+            f"FOCUS THIS QUESTION ON SKILL: {next_skill}\n"
+            f"ANGLE: {next_angle}\n"
+            f"Confidence: {fused_confidence}/100\n\n"
+            f"Generate the question now."
+        )
+
     else:
-        system_prompt = f"""
-    Technical interviewer. {context} | Difficulty: {difficulty}
-    Previous questions (DO NOT REPEAT OR REPHRASE): {prev_q_str}
-    {performance_hint}
-    Stay strictly within {tech}. Generate ONE short follow-up question that extends their last answer.
-    No code — focus on "why" and "how". If confidence is low ({fused_confidence}%), be encouraging.
-    {CONCISE_RULE}
-    Return ONLY a valid JSON object: {{"question": "...", "difficulty": "{difficulty}"}}
-    """
+        system_prompt = CUSTOM_ADAPTIVE_SYSTEM
+        user_msg = (
+            f"Context: Technical Interview — Technology: {tech}\n"
+            f"Difficulty: {difficulty}\n"
+            f"Previous questions (DO NOT REPEAT OR REPHRASE): {prev_q_str}\n"
+            f"{performance_hint}\n\n"
+            f"Stay strictly within {tech}. Confidence: {fused_confidence}/100\n\n"
+            f"Generate the question now."
+        )
 
     try:
-        chat_completion = client.chat.completions.create(
-            messages=[{"role": "system", "content": system_prompt}],
-            model="llama-3.1-8b-instant",
-            temperature=0.9,
-            response_format={"type": "json_object"}
-        )
-        return json.loads(chat_completion.choices[0].message.content)
+        text = _call_claude(system_prompt, user_msg, temperature=0.9)
+        return _extract_json(text)
     except Exception as e:
-        print(f"❌ Groq API Error in generate_adaptive_question: {e}")
+        print(f"❌ Anthropic API Error in generate_adaptive_question: {e}")
         return {"question": "Explain the data flow in your recent project architecture.", "difficulty": difficulty}
