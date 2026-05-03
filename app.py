@@ -112,55 +112,68 @@ def adaptive_step():
         skills = data.get('skills', [])
 
         # 1. Evaluate Textual Accuracy
-        eval_result = evaluate_answer(question_text, answer_text)
-        last_score = eval_result.get('score', 0) if not was_skipped else 0
+        # Skip the LLM call entirely on skipped questions — no answer to evaluate,
+        # saves an API call + ~1s latency.
+        if was_skipped:
+            eval_result = {"score": 0, "feedback": "Question skipped — no answer given."}
+            last_score = 0
+        else:
+            eval_result = evaluate_answer(question_text, answer_text)
+            last_score = eval_result.get('score', 0)
 
         # 2. Audio Confidence — dual-mode
         #    AUDIO_MODE=real → decode base64 audio, run SER model (local)
         #    AUDIO_MODE=size → size-based heuristic only (Render)
+        # Skip audio analysis entirely on skipped questions — silence has no signal.
         audio_confidence = None
         audio_emotion = None
         audio_size = data.get('audio_size', 0)
         audio_base64 = data.get('audio_base64')
 
-        if AUDIO_MODE == "real" and audio_base64:
-            tmp_path = None
-            try:
-                # Validate base64 before writing to disk
+        if was_skipped:
+            print("⏭️  Skipped — no audio analysis, no evaluator call")
+        else:
+            if AUDIO_MODE == "real" and audio_base64:
+                tmp_path = None
                 try:
-                    audio_bytes = base64.b64decode(audio_base64, validate=True)
-                except (binascii.Error, ValueError) as decode_err:
-                    raise ValueError(f"Invalid base64 audio payload: {decode_err}")
-
-                with tempfile.NamedTemporaryFile(suffix='.webm', delete=False) as tmp:
-                    tmp.write(audio_bytes)
-                    tmp_path = tmp.name
-
-                from utils.audio_analyzer import analyze_audio
-                ser_result = analyze_audio(tmp_path)
-                if ser_result is not None:
-                    audio_confidence = ser_result['confidence']
-                    audio_emotion = ser_result['emotion']
-                    print(f"🎙️ SER | Emotion: {audio_emotion} | Confidence: {audio_confidence}")
-                else:
-                    audio_confidence = analyze_audio_size(audio_size)
-                    print(f"🎙️ SER unavailable, using size heuristic: {audio_confidence}")
-            except Exception as audio_err:
-                print(f"⚠️ Audio SER fallback: {audio_err}")
-                audio_confidence = analyze_audio_size(audio_size)
-            finally:
-                if tmp_path and os.path.exists(tmp_path):
+                    # Validate base64 before writing to disk
                     try:
-                        os.remove(tmp_path)
-                    except Exception:
-                        pass
-        elif audio_size and audio_size > 0:
-            audio_confidence = analyze_audio_size(audio_size)
-            print(f"Audio Confidence (size-based): {audio_confidence} ({audio_size} bytes)")
+                        audio_bytes = base64.b64decode(audio_base64, validate=True)
+                    except (binascii.Error, ValueError) as decode_err:
+                        raise ValueError(f"Invalid base64 audio payload: {decode_err}")
 
-        # Safety default — never pass None to the brain (fusion math breaks)
-        if audio_confidence is None:
-            audio_confidence = 50
+                    with tempfile.NamedTemporaryFile(suffix='.webm', delete=False) as tmp:
+                        tmp.write(audio_bytes)
+                        tmp_path = tmp.name
+
+                    from utils.audio_analyzer import analyze_audio
+                    ser_result = analyze_audio(tmp_path)
+                    if ser_result is not None:
+                        audio_confidence = ser_result['confidence']
+                        audio_emotion = ser_result['emotion']
+                        print(f"🎙️ SER | Emotion: {audio_emotion} | Confidence: {audio_confidence}")
+                    else:
+                        audio_confidence = analyze_audio_size(audio_size)
+                        print(f"🎙️ SER unavailable, using size heuristic: {audio_confidence}")
+                except Exception as audio_err:
+                    print(f"⚠️ Audio SER fallback: {audio_err}")
+                    audio_confidence = analyze_audio_size(audio_size)
+                finally:
+                    if tmp_path and os.path.exists(tmp_path):
+                        try:
+                            os.remove(tmp_path)
+                        except Exception:
+                            pass
+            elif audio_size and audio_size > 0:
+                audio_confidence = analyze_audio_size(audio_size)
+                print(f"Audio Confidence (size-based): {audio_confidence} ({audio_size} bytes)")
+
+            # Safety default for ANSWERED questions — fall back to neutral if SER returned nothing
+            if audio_confidence is None:
+                audio_confidence = 50
+
+        # Note: when was_skipped, audio_confidence stays None — brain.fuse_confidence
+        # handles this by falling back to face-only score.
 
         # 3. RL Brain Logic — fuses face + audio confidence (Goal #20)
         next_diff, fused_confidence = brain.decide_next_level(

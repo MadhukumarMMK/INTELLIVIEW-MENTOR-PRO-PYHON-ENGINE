@@ -89,6 +89,36 @@ def _extract_json(text: str) -> dict:
     return json.loads(text)
 
 
+def _normalize_adaptive_payload(parsed: dict, fallback_difficulty: str) -> dict:
+    """
+    Adaptive endpoint expects {"question": str, "difficulty": str}.
+    But Claude occasionally returns the initial-question shape
+    {"questions": [str]} — accept that too. Returns a guaranteed-valid
+    payload, or raises ValueError if neither shape has a question.
+    """
+    if not isinstance(parsed, dict):
+        raise ValueError(f"Expected JSON object, got {type(parsed).__name__}")
+
+    # Try the canonical shape first
+    q = parsed.get("question")
+
+    # Fall back to the initial-question shape
+    if not q and isinstance(parsed.get("questions"), list) and parsed["questions"]:
+        q = parsed["questions"][0]
+
+    # If question is itself a dict (rare), pull text out of it
+    if isinstance(q, dict):
+        q = q.get("question") or q.get("text")
+
+    if not q or not isinstance(q, str) or not q.strip():
+        raise ValueError(f"No usable 'question' in payload: {parsed}")
+
+    return {
+        "question": q.strip(),
+        "difficulty": parsed.get("difficulty") or fallback_difficulty,
+    }
+
+
 def _call_claude(system_prompt: str, user_message: str, temperature: float) -> str:
     """Single Anthropic call with cached system prompt. Returns the text content."""
     response = client.messages.create(
@@ -255,9 +285,24 @@ def generate_adaptive_question(tech, skills, difficulty, previous_questions, mod
             f"Generate the question now."
         )
 
-    try:
-        text = _call_claude(system_prompt, user_msg, temperature=0.9)
-        return _extract_json(text)
-    except Exception as e:
-        print(f"❌ Anthropic API Error in generate_adaptive_question: {e}")
-        return {"question": "Explain the data flow in your recent project architecture.", "difficulty": difficulty}
+    # Mode-specific fallback questions — never let the user get stuck.
+    if mode == "hr":
+        fallback = "Tell me about a time you had to adapt to an unexpected change at work."
+    elif mode == "resume":
+        fallback = "Walk me through a technical decision you made on a recent project and the trade-offs involved."
+    else:
+        fallback = f"Explain a core architectural concept in {tech or 'your stack'} and why it matters."
+
+    # Try once, retry once on bad shape (Claude sometimes returns the wrong JSON
+    # schema — accepting either form via _normalize_adaptive_payload). If both
+    # attempts fail, return a safe fallback so the interview never deadlocks.
+    for attempt in range(2):
+        try:
+            text = _call_claude(system_prompt, user_msg, temperature=0.9)
+            parsed = _extract_json(text)
+            return _normalize_adaptive_payload(parsed, difficulty)
+        except Exception as e:
+            print(f"⚠️  Adaptive question attempt {attempt + 1}/2 failed: {e}")
+
+    print("❌ Both attempts failed — returning fallback question to keep interview moving.")
+    return {"question": fallback, "difficulty": difficulty}
