@@ -1,5 +1,6 @@
 import os
 import re
+import json
 
 # Try pdfminer first (better extraction), fallback to PyPDF2
 try:
@@ -19,6 +20,24 @@ try:
     HAS_DOCX = True
 except ImportError:
     HAS_DOCX = False
+
+# Anthropic client for LLM-based extraction. Cleaner than regex — understands
+# context, picks up modern skills not in any hardcoded list, handles odd
+# formatting. Falls back to the regex parser below if the API call fails.
+# Defensive: catch ANY exception during setup (missing package, invalid key,
+# network error during init) so module import never fails.
+_claude = None
+try:
+    from anthropic import Anthropic
+    _api_key = os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("Anthropic_API_KEY")
+    if _api_key:
+        _claude = Anthropic(api_key=_api_key)
+        print("✅ Resume parser: Claude SDK initialized")
+    else:
+        print("⚠️  Resume parser: ANTHROPIC_API_KEY not set — will use regex fallback only")
+except Exception as e:
+    print(f"⚠️  Resume parser: Claude SDK init failed ({e}) — will use regex fallback only")
+    _claude = None
 
 
 SKILLS_DB = [
@@ -107,16 +126,102 @@ def extract_text_from_file(file_path):
         raise ValueError("Unsupported format. Upload .pdf or .docx")
 
 
+def _extract_with_claude(text):
+    """
+    Use Claude haiku-4-5 to intelligently extract structured data from resume text.
+    Returns the same dict shape as the regex parser, or None on failure.
+    Far more accurate than regex/SKILLS_DB matching — understands context,
+    picks up modern tech, handles unusual formatting and resume layouts.
+    """
+    if not _claude or not text:
+        return None
+
+    # Cap input to ~12k chars to keep cost predictable (resumes rarely exceed this)
+    snippet = text[:12000]
+
+    system_prompt = """You are a precise resume parser. Extract structured data from the resume text and return ONLY a JSON object — no preamble, no markdown fences.
+
+Required fields:
+  - name: full name of the candidate (string or null if not found)
+  - email: primary email address (string or null)
+  - mobile_number: phone number, digits only, may include leading +country code (string, may be empty "")
+  - skills: array of technical skills mentioned (programming languages, frameworks, tools, databases, cloud, etc.). Include ALL skills found, not just popular ones. Capitalize properly (e.g. "Python", "React.js", "AWS"). Limit to most relevant 25.
+  - job_role: best inferred role from the resume (e.g. "Full Stack Developer", "Data Scientist", "Software Engineer"). String.
+  - sector: industry sector (e.g. "Information Technology", "Data & Analytics", "Finance"). String.
+  - linkedin: LinkedIn profile URL if present (string or null)
+  - github: GitHub profile URL if present (string or null)
+
+Rules:
+  - Skills must be ACTUAL technologies or tools, not soft skills like "teamwork".
+  - If a field is genuinely not present, return null (or "" for mobile_number, [] for skills).
+  - Do NOT invent or guess. Better null than wrong.
+  - Output strict JSON only."""
+
+    try:
+        response = _claude.messages.create(
+            model="claude-haiku-4-5",
+            max_tokens=1024,
+            temperature=0.1,
+            system=[{
+                "type": "text",
+                "text": system_prompt,
+                "cache_control": {"type": "ephemeral"},
+            }],
+            messages=[{"role": "user", "content": f"Resume text:\n\n{snippet}"}],
+        )
+        raw = next((b.text for b in response.content if b.type == "text"), "")
+        # Strip markdown fences if Claude added them despite instructions
+        raw = raw.strip()
+        if raw.startswith("```"):
+            raw = raw.split("```", 2)[1]
+            if raw.lstrip().lower().startswith("json"):
+                raw = raw.lstrip()[4:]
+            raw = raw.strip()
+
+        parsed = json.loads(raw)
+        # Normalize fields to expected types
+        return {
+            "name":          parsed.get("name") or None,
+            "email":         parsed.get("email") or None,
+            "mobile_number": parsed.get("mobile_number") or "",
+            "skills":        parsed.get("skills") if isinstance(parsed.get("skills"), list) else [],
+            "job_role":      parsed.get("job_role") or "Software Developer",
+            "sector":        parsed.get("sector") or "Information Technology",
+            "linkedin":      parsed.get("linkedin") or None,
+            "github":        parsed.get("github") or None,
+        }
+    except Exception as e:
+        print(f"⚠️  Claude resume extraction failed (will fall back to regex): {e}")
+        return None
+
+
 def extract_data_from_pdf(file_path):
     """
     Production resume parser.
     Returns: name, email, mobile_number, skills, job_role, sector, linkedin, github
+
+    Strategy:
+      1. Extract raw text from PDF/DOCX (pdfminer.six / PyPDF2 / docx2txt)
+      2. Try Claude haiku-4-5 first — semantic extraction, picks up everything
+      3. Fall back to the regex/SKILLS_DB parser if Claude is unavailable or
+         returns junk. Two layers of defense → resume parsing always returns
+         SOMETHING usable.
     """
     try:
         text = extract_text_from_file(file_path)
 
         if not text or len(text.strip()) < 20:
             return {"name": None, "email": None, "mobile_number": "", "skills": ["Python"], "job_role": "Developer", "sector": "IT"}
+
+        # --- Try Claude first ---
+        claude_result = _extract_with_claude(text)
+        if claude_result and (claude_result.get("name") or claude_result.get("email") or claude_result.get("skills")):
+            print(f"✅ Resume parsed via Claude: name={claude_result.get('name')}, "
+                  f"skills={len(claude_result.get('skills') or [])}")
+            return claude_result
+
+        # --- Fallback: regex parser below ---
+        print("⚠️  Claude unavailable or returned empty — using regex fallback")
 
         text_lower = text.lower()
         lines = [line.strip() for line in text.split('\n') if line.strip()]
