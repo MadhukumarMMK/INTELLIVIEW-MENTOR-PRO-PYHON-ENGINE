@@ -35,15 +35,20 @@ def _extract_json(text: str) -> dict:
 
 
 def evaluate_answer(question, user_answer):
-    # Safety check: Anthropic client failed to initialize
+    # Safety check: Anthropic client failed to initialize. We can't evaluate
+    # without it — surface a clearly-flagged fallback so the user / admin
+    # knows scoring is degraded.
     if not client:
-        return {"score": 50, "feedback": "AI Engine configuration missing. Check .env file."}
+        return {"score": 0, "feedback": "AI Engine configuration missing. Check .env file."}
 
-    # Goal #9 & #10: Handle skipped or very short answers gracefully
-    if not user_answer or len(user_answer.strip()) < 5:
-        return {"score": 0, "feedback": "The answer was too short or skipped to be evaluated technically."}
+    # EVERY answer is sent to Anthropic so scoring is consistent and fair.
+    # Empty or very-short answers are passed through as-is — Claude judges
+    # them too. We just normalize the placeholder so the prompt isn't blank.
+    cleaned_answer = (user_answer or "").strip()
+    if not cleaned_answer:
+        cleaned_answer = "(The candidate did not provide an answer.)"
 
-    user_message = f"Question: {question}\n\nCandidate's Answer: {user_answer}"
+    user_message = f"Question: {question}\n\nCandidate's Answer: {cleaned_answer}"
 
     try:
         response = client.messages.create(

@@ -68,7 +68,7 @@ def generate_questions():
     try:
         data = request.json
         # Extract parameters with safety defaults
-        mode = data.get('mode', 'custom') 
+        mode = data.get('mode', 'custom')
         tech = data.get('tech', 'General')
         module = data.get('module', 'General')
         topic = data.get('topic', 'General')
@@ -79,14 +79,14 @@ def generate_questions():
 
         # Pass all parameters to the updated generator
         result = generate_interview_questions(
-            tech=tech, 
-            module=module, 
-            topic=topic, 
-            difficulty=difficulty, 
-            mode=mode, 
+            tech=tech,
+            module=module,
+            topic=topic,
+            difficulty=difficulty,
+            mode=mode,
             skills=skills
         )
-        
+
         return jsonify({"data": result}), 200
     except Exception as e:
         print(f"🔥 Generation Error: {e}")
@@ -112,14 +112,12 @@ def adaptive_step():
         skills = data.get('skills', [])
 
         # 1. Evaluate Textual Accuracy
-        # Skip the LLM call entirely on skipped questions — no answer to evaluate,
-        # saves an API call + ~1s latency.
-        if was_skipped:
-            eval_result = {"score": 0, "feedback": "Question skipped — no answer given."}
-            last_score = 0
-        else:
-            eval_result = evaluate_answer(question_text, answer_text)
-            last_score = eval_result.get('score', 0)
+        # EVERY answer goes to Anthropic — the LLM judges relevance and
+        # correctness consistently across all questions. Empty / silent
+        # answers are forwarded with a placeholder so the model evaluates
+        # them as no-answer rather than us hardcoding a score.
+        eval_result = evaluate_answer(question_text, answer_text)
+        last_score = eval_result.get('score', 0)
 
         # 2. Audio Confidence — dual-mode
         #    AUDIO_MODE=real → decode base64 audio, run SER model (local)
